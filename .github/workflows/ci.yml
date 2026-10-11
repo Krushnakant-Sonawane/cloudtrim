@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       AWS_DEFAULT_REGION: us-east-1
       AWS_ACCESS_KEY_ID: testing
@@ -32,13 +32,13 @@ jobs:
 
   build-and-scan:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t cloudtrim:${{ github.sha }} .
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: cloudtrim:${{ github.sha }}
           severity: CRITICAL,HIGH
