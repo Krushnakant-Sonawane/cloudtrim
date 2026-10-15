@@ -1,0 +1,101 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; never cancel one that is halfway through
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # needed to request the OIDC token
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: cloudtrim
+  ECS_CLUSTER: cloudtrim-cluster
+  ECS_SERVICE: cloudtrim
+  TASK_FAMILY: cloudtrim
+  CONTAINER_NAME: cloudtrim
+  ROLE_ARN: arn:aws:iam::975769100988:role/cloudtrim-github-deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: cloudtrim-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and push image tagged with the commit SHA
+        id: image
+        run: |
+          REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TAG="${GITHUB_SHA::12}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Register a new task definition revision
+        id: taskdef
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > current.json
+          jq --arg img "$IMAGE" --arg ver "$TAG" --arg name "$CONTAINER_NAME" '
+            .containerDefinitions |= map(
+              if .name == $name then
+                .image = $img
+                | .environment |= map(if .name == "APP_VERSION" then .value = $ver else . end)
+              else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+          ' current.json > new.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://new.json \
+                --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" > /dev/null
+
+      - name: Wait for the deployment to become stable
+        run: |
+          # Fails the job if the new tasks never become healthy (ECS also rolls back by itself)
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Verify the new version is what is actually running
+        env:
+          EXPECTED: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          RUNNING=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`].taskDefinition | [0]' --output text)
+          echo "expected: $EXPECTED"
+          echo "running : $RUNNING"
+          if [ "$RUNNING" != "$EXPECTED" ]; then
+            echo "::error::ECS rolled back to the previous version, so the new image is unhealthy"
+            exit 1
+          fi
+
+      - name: Check load balancer target health
+        run: |
+          TG_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+          aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+            --query 'TargetHealthDescriptions[].TargetHealth.State' --output text | tee states.txt
+          grep -qw healthy states.txt

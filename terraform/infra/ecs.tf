@@ -70,4 +70,10 @@ resource "aws_ecs_service" "app" {
   }
 
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.execution]
+
+  # The CD pipeline registers new task definition revisions and deploys them.
+  # Without this, the next "terraform apply" would roll the app back to the revision Terraform made.
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
 }
