@@ -24,7 +24,7 @@ def health():
 
 
 @app.get("/findings")
-def findings(region: str = "us-east-1"):
+def findings(region: str = os.getenv("AWS_DEFAULT_REGION", "us-east-1")):
     try:
         return run_scan(region)
     except (BotoCoreError, ClientError) as e:  # AWS/credential problems only
